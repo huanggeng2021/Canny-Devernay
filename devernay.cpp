@@ -281,15 +281,7 @@ static void compute_edge_points(cv::Mat& Ex, cv::Mat& Ey, cv::Mat& modG,
             }
         }
     }
-#ifdef GTest
-    cv::FileStorage fesx("Ex.yml", cv::FileStorage::WRITE);
-    fesx << "Ex" << Ex;
-    fesx.release();
 
-    cv::FileStorage fesy("Ey.yml", cv::FileStorage::WRITE);
-    fesy << "Ey" << Ey;
-    fesy.release();
-#endif // GTest
 
 
 }
@@ -503,20 +495,215 @@ static void chain_edge_points(int *next, int *prev, cv::Mat& Ex, cv::Mat& Ey,
             }
         }
     }
- 
-#ifdef GTest
-    //  打开输出文件
-    std::ofstream file("next.txt");
-    for (int i = 0; i < X * Y; i++) {
-        file << next[i] << std::endl;
-    }
-    file.close();
-#endif // GTest
+
 
 
 
 }
 
+/*----------------------------------------------------------------------------*/
+/* apply Canny thresholding with hysteresis  双阈值
+
+   next and prev contain the number of next and previous edge points in the
+   chain or -1 when not chained. modG is modulus of the image gradient. X,Y is
+   the image size. th_h and th_l are the high and low thresholds, respectively.
+
+   this function modifies next and prev, removing chains not satisfying the
+   thresholds.
+ */
+static void thresholds_with_hysteresis(int* next, int* prev,
+    cv::Mat &modG, int X, int Y,
+    double th_h, double th_l) {
+
+    /*check input*/
+    if (next == NULL || prev == NULL || modG.empty())
+        error("thresholds_with_hysteresis: invalid input");
+
+    cv::Mat vaild(Y, X, CV_8UC1);  // 用于表示是否为有效边缘点
+    vaild.setTo(0);
+
+    /* validate all edge points over th_h or connected to them and over th_l 按行索引*/
+    for (int col = 0; col < X; col++) {
+        for (int row = 0; row < Y; row++) {
+
+            int index = col + row * X;       /* prev[i]>=0 or next[i]>=0 implies an edge point  找到一个强边缘*/
+            if ((prev[index] >= 0 || next[index] >= 0)  ) {
+                if (!vaild.at<uchar>(row, col) && modG.at<double>(row, col) >= th_h) {
+
+                    vaild.at<uchar>(row, col) = 1; /* mark as valid the new point */
+
+                    /* follow the chain of edge points forwards */
+                    int k = next[index];
+                    int j = index;
+                    while (k >= 0 && !vaild.at<uchar>(k / X, k % X)) {
+
+                        if (modG.at<double>(k / X, k % X) < th_l) {   //小于最低阈值
+                            next[j] = -1;   /* cut the chain when the point is below th_l 断开后向链接*/
+                            prev[k] = -1;  /* j must be assigned to next[j] and not k,    断开下个连接点的前向链接
+                                          so the loop is chained in this case */
+                            break;
+                        }
+                        else {
+                            vaild.at<uchar>(k / X, k % X) = 1;   /* otherwise mark the new point as valid */
+                            j = k;
+                            k = next[j];
+                        }
+
+                    }
+
+
+             
+
+                    /* follow the chain of edge points backwards */
+                    k = prev[index];
+                    j = index;
+                    while (k >= 0 && !vaild.at<uchar>(k / X, k % X)) {
+
+                        if (modG.at<double>(k / X, k % X) < th_l) {   //小于最低阈值
+                            prev[j] = -1;   /* cut the chain when the point is below th_l 断开后向链接*/
+                            next[k] = -1;  /* j must be assigned to next[j] and not k,    断开下个连接点的前向链接
+                                          so the loop is chained in this case */
+                            break;
+                        }
+                        else {
+                            vaild.at<uchar>(k / X, k % X) = 1;   /* otherwise mark the new point as valid */
+                            j = k;
+                            k = prev[j];
+                        }
+
+                    }
+                }
+
+            }
+
+        }
+
+    }
+
+    /* 移除剩余所有无效点 */
+    for (int i = 0; i < X; i++) {
+        for (int j = 0; j < Y; j++) {
+            int p = i + j * X;
+            if ((prev[p] >= 0 || next[p] >= 0) && !vaild.at<uchar>(j, i)) {
+                prev[p] = next[p] = -1;
+            }
+        }
+    }
+
+}
+
+/*----------------------------------------------------------------------------*/
+/* create a list of chained edge points composed of 3 lists
+   x, y and curve_limits; it also computes N (the number of edge points) and
+   M (the number of curves).
+
+   x[i] and y[i] (0<=i<N) store the sub-pixel coordinates of the edge points.
+   curve_limits[j] (0<=j<=M) stores the limits of each chain in lists x and y.
+
+   x, y, and curve_limits will be allocated.
+
+   example:
+
+     curve number k (0<=k<M) consists of the edge points x[i],y[i]
+     for i determined by curve_limits[k] <= i < curve_limits[k+1].
+
+     curve k is closed if x[curve_limits[k]] == x[curve_limits[k+1] - 1] and
+                          y[curve_limits[k]] == y[curve_limits[k+1] - 1].
+ */
+static void list_chained_edge_points(double** x, double** y, int* N,
+    int** curve_limits, int* M,
+    int* next, int* prev,
+    cv::Mat &Ex, cv::Mat &Ey, int X, int Y) {
+    int i, k, n;
+
+    /* initialize output: x, y, curve_limits, N, and M
+
+       there cannot be more than X*Y edge points to be put in the output list:
+       edge points must be local maxima of gradient modulus, so at most half of
+       the pixels could be so. when a closed curve is found, one edge point will
+       be put twice to the output. even if all possible edge points (half of the
+       pixels in the image) would form one pixel closed curves (which is not
+       possible) that would lead to output X*Y edge points.
+
+       for the same reason, there cannot be more than X*Y curves: the worst case
+       is when all possible edge points (half of the pixels in the image) would
+       form one pixel chains. in that case (which is not possible) one would need
+       a size for curve_limits of X*Y/2+1. so X*Y is enough.
+
+       (curve_limits requires one more item than the number of curves.
+        a simplest example is when only one chain of length 3 is present:
+        curve_limits[0] = 0, curve_limits[1] = 3.)
+     */
+    *x = (double*)malloc(X * Y * sizeof(double));
+    *y = (double*)malloc(X * Y * sizeof(double));
+    *curve_limits = (int*)malloc(X * Y * sizeof(int));
+    *N = 0;
+    *M = 0;
+
+    /* copy chained edge points to output */
+    for (i = 0; i < X * Y; i++)   /* prev[i]>=0 or next[i]>=0 implies an edge point */
+        if (prev[i] >= 0 || next[i] >= 0)
+        {
+            /* a new chain found, set chain starting index to the current point
+               and then increase the curve counter */
+            (*curve_limits)[*M] = *N;
+            ++(*M);
+
+            /* set k to the beginning of the chain, or to i if closed curve */
+            for (k = i; (n = prev[k]) >= 0 && n != i; k = n);
+
+            /* follow the chain of edge points starting on k */
+            do
+            {
+                /* store the current point coordinates in the output lists */
+                (*x)[*N] = Ex.at<double>(k / X, k % X);
+                (*y)[*N] = Ey.at<double>(k / X, k % X);
+                ++(*N);
+
+                n = next[k];   /* save the id of the next point in the chain */
+
+                next[k] = -1;  /* unlink chains from k so it is not used again */
+                prev[k] = -1;
+
+                /* for closed curves, the initial point is included again as
+                   the last point of the chain. actually, testing if the first
+                   and last points are equal is the only way to know that it is
+                   a closed curve.
+
+                   to understand that this code actually repeats the first point,
+                   consider a closed chain as follows:  a--b
+                                                        |  |
+                                                        d--c
+
+                   let us say that the algorithm starts by point a. it will store
+                   the coordinates of point a and then unlink a-b. then, will store
+                   point b and unlink b-c, and so on. but the link d-a is still
+                   there. (point a is no longer pointing backwards to d, because
+                   both links are removed at each step. but d is indeed still
+                   pointing to a.) so it will arrive at point a again and store its
+                   coordinates again as last point. there, it cannot continue
+                   because the link a-b was removed, there would be no next point,
+                   k would be -1 and the curve is finished.
+                 */
+
+                k = n;  /* set the current point to the next in the chain */
+            } while (k >= 0); /* continue while there is a next point in the chain */
+        }
+    (*curve_limits)[*M] = *N; /* store end of the last chain */
+}
+
+
+
+void save_edge_points_txt(double** x, double** y, int N, const char* filename)
+{
+    std::ofstream fout(filename);
+    if (!fout) return;
+
+    for (int i = 0; i < N; i++)
+        fout << (*x)[i] << "," << (*y)[i] << "\n";
+
+    fout.close();
+}
 
 
 /*----------------------------------------------------------------------------*/
@@ -558,7 +745,6 @@ static void chain_edge_points(int *next, int *prev, cv::Mat& Ex, cv::Mat& Ey,
      curve k is closed if x[curve_limits[k]] == x[curve_limits[k+1] - 1] and
                           y[curve_limits[k]] == y[curve_limits[k+1] - 1].
  */
-
 void devernay(double** x, double** y, int* N, int** curve_limits, int* M,    // 输入输出
     cv::Mat& image, int X, int Y,
     double sigma, double th_h, double th_l) {
@@ -585,13 +771,62 @@ void devernay(double** x, double** y, int* N, int** curve_limits, int* M,    // 
     cv::FileStorage fsy("Gy.yml", cv::FileStorage::WRITE);
     fsy << "Gy" << Gy;
     fsy.release();
+
+    cv::FileStorage fmod("modG.yml", cv::FileStorage::WRITE);
+    fmod << "modG" << modG;
+    fmod.release();
 #endif // GTest
 
     cv::Mat Ex(Y, X, CV_64F);        /* edge_x */
     cv::Mat Ey(Y, X, CV_64F);        /* edge_y */
     compute_edge_points(Ex, Ey, modG, Gx, Gy, X, Y);
 
+#ifdef GTest
+    cv::FileStorage fesx("Ex.yml", cv::FileStorage::WRITE);
+    fesx << "Ex" << Ex;
+    fesx.release();
+
+    cv::FileStorage fesy("Ey.yml", cv::FileStorage::WRITE);
+    fesy << "Ey" << Ey;
+    fesy.release();
+#endif // GTest
+
     int* next = (int*)malloc(X * Y * sizeof(int));
     int* prev = (int*)malloc(X * Y * sizeof(int));
     chain_edge_points(next, prev, Ex, Ey, Gx, Gy, X, Y);
+
+#ifdef GTest
+    //  打开输出文件
+    std::ofstream file("next.txt");
+    for (int i = 0; i < X * Y; i++) {
+        file << next[i] << std::endl;
+    }
+    file.close();
+
+    std::ofstream file_p("prev.txt");
+    for (int i = 0; i < X * Y; i++) {
+        file_p << prev[i] << std::endl;
+    }
+    file_p.close();
+#endif // GTest
+
+    thresholds_with_hysteresis(next, prev, modG, X ,Y, th_h, th_l);
+
+#ifdef GTest
+    //  打开输出文件
+    std::ofstream file1("next_threshold.txt");
+    for (int i = 0; i < X * Y; i++) {
+        file1 << next[i] << std::endl;
+    }
+    file1.close();
+#endif // GTest
+
+
+    list_chained_edge_points(x, y, N, curve_limits, M, next, prev, Ex, Ey, X, Y);
+    
+#ifdef GTest
+    save_edge_points_txt(x, y, X * Y, "sub_pixel.txt");
+#endif // GTest
+
+
 }
