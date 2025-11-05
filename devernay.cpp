@@ -8,7 +8,10 @@
 #ifndef TRUE
 #define TRUE 1
 #endif /* !TRUE */
+
 #include "devernay.h"
+#include <fstream>
+
 
 /*----------------------------------------------------------------------------*/
 /* fatal error, print a message to standard error and exit
@@ -27,6 +30,7 @@ static double dist(double x1, double y1, double x2, double y2)
 {
     return sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
 }
+inline int idx(int x, int y, int X) { return y * X + x; }
 
 
 
@@ -182,15 +186,16 @@ static void gaussian_filter(cv::Mat& image, int X, int Y, double sigma, cv::Mat&
     cv::normalize(out, mag8U, 0, 255, cv::NORM_MINMAX);
     mag8U.convertTo(mag8U, CV_8U);
     cv::imwrite("gradient_magnitude.png", mag8U);
-#endif // GTest
-
-    out.copyTo(grad_image);
     // 关于cv::Mat 之间的拷贝
     /*
         cv::Mat A , B;
         A = B; 浅拷贝  两者共用同一块地址
         B.copyTo(A);  深拷贝   比clone更灵活
     */
+#endif // GTest
+
+    out.copyTo(grad_image);
+
 }
 
 
@@ -208,11 +213,13 @@ static int greater(double a, double b)
     return TRUE; /* greater */
 }
 
+
+
 static void compute_edge_points(cv::Mat& Ex, cv::Mat& Ey, cv::Mat& modG,
     cv::Mat& Gx, cv::Mat& Gy, int X, int Y) {
 
     /* check input */
-    if (Ex.data == NULL || Ey.data == NULL || modG.data == NULL || Gx.data == NULL || Gy.data == NULL)
+    if (Ex.empty() || Ey.empty() || modG.empty() || Gx.empty() || Gy.empty())
         error("compute_edge_points: invalid input");
 
     Ex.setTo(-1.0), Ey.setTo(-1.0);   // 记录是否为边缘点
@@ -235,8 +242,8 @@ static void compute_edge_points(cv::Mat& Ex, cv::Mat& Ey, cv::Mat& modG,
             double mod = modG.at<double>(y, x);       /* modG at pixel              */
             double L = modG.at<double>(y, x - 1);     /* modG at pixel on the left  */
             double R = modG.at<double>(y, x + 1);     /* modG at pixel on the right */
-            double U = modG.at<double>(x + 1, y);     /* modG at pixel up           */
-            double D = modG.at<double>(x - 1, y);     /* modG at pixel below        */
+            double U = modG.at<double>(y + 1, x);     /* modG at pixel up           */
+            double D = modG.at<double>(y - 1, x);     /* modG at pixel below        */
 
             double gx = fabs(Gx.at<double>(y, x));
             double gy = fabs(Gy.at<double>(y, x));
@@ -285,8 +292,6 @@ static void compute_edge_points(cv::Mat& Ex, cv::Mat& Ey, cv::Mat& modG,
 #endif // GTest
 
 
-
-
 }
 
 
@@ -306,19 +311,20 @@ static void compute_edge_points(cv::Mat& Ex, cv::Mat& Ey, cv::Mat& modG,
 static double chain(cv::Point2i from, cv::Point2i to, cv::Mat& Ex, cv::Mat& Ey,
     cv::Mat& Gx, cv::Mat& Gy, int X, int Y) {
 
-    double dx, dy;
-
     /* check input */
-    if (Ex.data == NULL || Ey.data == NULL || Gx.data == NULL || Gy.data == NULL)
+    if (Ex.empty() || Ey.empty() || Gx.empty() || Gy.empty())
         error("chain: invalid input");
-    if (from.x < 0 || to.x < 0 || from.x * from.y >= X * Y || to.x * to.y >= X * Y)
+    if (from.x < 0 || from.x >= X || from.y < 0 || from.y >= Y || 
+         to.x < 0 || to.x >= X || to.y < 0 || to.y >= Y )
         error("chain: one of the points is out the image");
 
     /* check that the points are different and valid edge points,
       otherwise return invalid chaining */
     if (from == to) return 0.0; /* same pixel, not a valid chaining */
-    if (Ex.at<double>(from.y, from.x) < 0.0 || Ey.at<double>(from.y, from.x) < 0.0 || Ex.at<double>(to.y, to.x) || Ey.at<double>(to.y, to.x))
+    if (Ex.at<double>(from.y, from.x) < 0.0 || Ey.at<double>(from.y, from.x) < 0.0 || Ex.at<double>(to.y, to.x) < 0.0 || Ey.at<double>(to.y, to.x) <0.0) {
         return 0.0;  /* one of them is not an edge point, not a valid chaining */
+    }
+        
 
     /* 在一个好的链接关系中， 梯度方向应该与待连接两点连接方向大致正交
 
@@ -334,10 +340,11 @@ static double chain(cv::Point2i from, cv::Point2i to, cv::Mat& Ex, cv::Mat& Ey,
       首先验证待连接两点的梯度方向是否一致， 否则返回无效连接
     */
 
+    double dx, dy;
     dx = Ex.at<double>(to.y, to.x) - Ex.at<double>(from.y, from.x);
     dy = Ey.at<double>(to.y, to.x) - Ey.at<double>(from.y, from.x);
 
-    if ((Gy.at<double>(from.y, from.x) * dx - Gx.at<double>(from.y, from.x) * dy) *
+    if ((Gy.at<double>(from.y, from.x) * dx - Gx.at<double>(from.y, from.x) * dy) *   // 验证梯度方向是否一致
         (Gy.at<double>(to.y, to.x) * dx - Gx.at<double>(to.y, to.x) * dy) <= 0.0) {
         return 0.0;  /* incompatible gradient angles, not a valid chaining */
 
@@ -346,10 +353,10 @@ static double chain(cv::Point2i from, cv::Point2i to, cv::Mat& Ex, cv::Mat& Ey,
     /*
     * 返回链接得分， 正向链接为正， 反向链接为负。 得分与到连接点距离成反比， 优先选择更近的点
     */
-    int x1 = Ex.at<double>(from.y, from.x);
-    int y1 = Ey.at<double>(from.y, from.x);
-    int x2 = Ex.at<double>(to.y, to.x);
-    int y2 = Ey.at<double>(to.y, to.x);
+    double x1 = Ex.at<double>(from.y, from.x);
+    double y1 = Ey.at<double>(from.y, from.x);
+    double x2 = Ex.at<double>(to.y, to.x);
+    double y2 = Ey.at<double>(to.y, to.x);
     if ((Gy.at<double>(from.y, from.x) * dx - Gx.at<double>(from.y, from.x) * dy) >= 0.0) {
         return 1.0 / dist(x1, y1, x2, y2);   // 正向链接
     }
@@ -373,109 +380,139 @@ static double chain(cv::Point2i from, cv::Point2i to, cv::Mat& Ex, cv::Mat& Ey,
            corresponding value is set to -1. next and prev must be allocated
            before calling.
  */
-static void chain_edge_points(cv::Mat &next, cv::Mat &prev, cv::Mat& Ex, cv::Mat& Ey,
+static void chain_edge_points(int *next, int *prev, cv::Mat& Ex, cv::Mat& Ey,
     cv::Mat& Gx, cv::Mat& Gy, int X, int Y) {
 
     /* check input */
-    if (next.data == NULL || prev.data == NULL || Ex.data == NULL || Ey.data == NULL || Gx.data == NULL || Gy.data == NULL)
+    if (next == NULL || prev == NULL || Ex.empty() || Ey.empty() || Gx.empty() || Gy.empty())
         error("chain_edge_points: invalid input");
 
     /* initialize next and prev as non linked */
-    //for (int i = 0; i < X * Y; i++) next[i] = prev[i] = -1;
-    next.setTo(-1);
-    prev.setTo(-1);
+    for (int i = 0; i < X * Y; i++) next[i] = prev[i] = -1;
+
     /* try each point to make local chains */
-    for (int x = 2; x < X; x++) {
-        for (int y = 2; y < Y; y++) {
-            if (Ex.at<double>(y, x) >= 0 && Ey.at<double>(y, x) >= 0) {  /* must be an edge point  该方法只插值水平与竖直两个方向*/
+    for (int x = 2; x < X - 2; x++) {
+        for (int y = 2; y < Y - 2; y++) {
+            if (Ex.at<double>(y, x) >= 0 && Ey.at<double>(y, x) >= 0) {  /* 判断是否为边缘点   该方法只插值水平与竖直两个方向*/
 
-                // int from = x + y * X;
-                cv::Point2i from(x, y);    // cv::Point(x, y) 的语义是 “x = 列（宽度方向）”，“y = 行（高度方向
-                double fwd_s = 0.0;  /* score of best forward chaining */
-                double bck_s = 0.0;  /* score of best backward chaining */
-                //int fwd = -1;        /* edge point of best forward chaining */
-                //int bck = -1;        /* edge point of best backward chaining */
+                cv::Point2i from(x, y);
+                double fwd_s = 0.0, bck_s = 0.0;
+                cv::Point2i fwd(-1, -1), bck(-1, -1);
 
-                cv::Point2i fwd(-1, -1);
-                cv::Point2i bck(-1, -1);
-                /*
-                * 便利所有距离两像素以及内的邻接点， 在大多数情况下，寻找两像素间距的连接候选点
-                * 足以构建能精确描述边缘的优质边缘点
-                */
-
+                // 搜索邻域
                 for (int i = -2; i <= 2; i++) {
                     for (int j = -2; j <= 2; j++) {
-                        // int to = x + i + (y + j) * X;   // 待连接边缘点的候选
                         cv::Point2i to(x + i, y + j);
-                        double s = chain(from, to, Ex, Ey, Gx, Ey, X, Y);
+                        if (to.x < 0 || to.x >= X || to.y < 0 || to.y >= Y) continue;
 
-                        if (s > fwd_s){  /* a better forward chaining found */
-                            fwd_s = s;   /* set the new best forward chaining */
+                        double s = chain(from, to, Ex, Ey, Gx, Gy, X, Y);
+                        if (s > fwd_s) {
+                            fwd_s = s;
                             fwd = to;
                         }
-                        if (s < bck_s) { /* a better backward chaining found */
-                            bck_s = s;   /* set the new best backward chaining */
+                        if (s < bck_s) {
+                            bck_s = s;
                             bck = to;
                         }
                     }
                 }
 
-                /*
-                    创建新链接前， 需要检查目标对象是否已存在链接
-                    若已存在， 则需判断现有链接是否优于拟建链接
+            
 
+            /*
+            创建新链接前， 需要检查目标对象是否已存在链接
+            若已存在， 则需判断现有链接是否优于拟建链接
+                
                             x alt                        x alt
                              \                          /
                               \                        /
                 from x---------x fwd              bck x---------x from
 
-                    我们知道从起点开始的最佳正向链接是from-fwd。
-                    但可能存在另一种抵达fwd的替代链接方案更优，
-                    使得alt-fwd比from-fwd更可取。类似情况也可能出现在反向链接中，
-                    可能存在比bck-from更优的bck-alt替代链接方案。
+            我们知道从起点开始的最佳正向链接是from-fwd。
+            但可能存在另一种抵达fwd的替代链接方案更优，
+            使得alt-fwd比from-fwd更可取。类似情况也可能出现在反向链接中，
+            可能存在比bck-from更优的bck-alt替代链接方案。
 
-                    在建立新链接前，需检查fwd/bck是否已被链接。若已存在链接，
-                    则需将拟建链接的得分与现有链接进行比较，仅保留两者中更优者。
+            在建立新链接前，需检查fwd/bck是否已被链接。若已存在链接，
+            则需将拟建链接的得分与现有链接进行比较，仅保留两者中更优者。
 
-                    此流程存在一个缺陷：最终结果可能受探索顺序的影响。
-                    考虑以下配置情况：
+            此流程存在一个缺陷：最终结果可能受探索顺序的影响。
+            考虑以下配置情况：
 
-                 a x-------x b
+                a x -------x b
+                           /
                           /
-                         /
-                      c x---x d    with score(a-b) < score(c-b) < score(c-d)
-                                   or equivalently ||a-b|| > ||b-c|| > ||c-d||
-                    
-                    顺序：a,b,c
-                    首先在探索a时会建立a-b链接。在分析b的后向链接时，系统将优先选择c-b，从而解除a-b链接。
-                    最后当探索c时，c-d将成为首选并解除c-b链接。最终结果仅保留c-d链接。
-                    
-                    顺序：c,b,a
-                    首先在探索c时会建立c-d链接。接着在探索b的后向连接时，虽然c-b本是优选链接，
-                    但由于已存在得分更高的c-d链接，c-b无法建立。
-                    最后当探索a时，由于b不存在更优的后向链接，将成功创建a-b链接。最终形成c-d和a-b两条链接。
-                    
-                    我们尚未找到能解决此问题的简易算法。所谓简易，是指无需多次遍历或重新评估断链点链合情况的算法。
+                       c x---x d    with score(a-b) < score(c-b) < score(c-d)
+                                    or equivalently ||a-b|| > ||b-c|| > ||c-d||
 
-                */
-                int fwd_index = fwd.y * X + fwd.x;
-                int alt_index;
-                cv::Point2i alt;
-                
-                if (fwd_index >= 0  && next.at<double>(from.y, from.x) != fwd_index && 
-                    ((alt_index = prev.at<double>(fwd.y, fwd.x) ||
-                        chain(alt, fwd, Ex, Ey, Gx,Gy, X, Y) < fwd_s))
-                    ) {
-                    if (next.at<double>(from.y, from.x) >= 0) {
-                        int px = next.at<double>(from.y, from.x);
+            顺序：a,b,c
+            首先在探索a时会建立a-b链接。在分析b的后向链接时，系统将优先选择c-b，从而解除a-b链接。
+            最后当探索c时，c-d将成为首选并解除c-b链接。最终结果仅保留c-d链接。
+
+            顺序：c,b,a
+            首先在探索c时会建立c-d链接。接着在探索b的后向连接时，虽然c-b本是优选链接，
+            但由于已存在得分更高的c-d链接，c-b无法建立。
+            最后当探索a时，由于b不存在更优的后向链接，将成功创建a-b链接。最终形成c-d和a-b两条链接。
+
+            我们尚未找到能解决此问题的简易算法。所谓简易，是指无需多次遍历或重新评估断链点链合情况的算法。
+
+            */
+                int from_index = idx(x, y, X);
+            // ----------- forward link -------------
+                if (fwd.x >= 0 && fwd.y >= 0) {
+                    int fwd_index = idx(fwd.x, fwd.y, X);
+                    int alt_index = prev[fwd_index];  // fwd 的前驱
+                    cv::Point2i alt(alt_index % X, alt_index / X);
+
+                    if (next[from_index] != fwd_index &&
+                        (alt_index < 0 || chain(alt, fwd, Ex, Ey, Gx, Gy, X, Y) < fwd_s)) {
+
+                        // 移除旧的 from 链
+                        if (next[from_index] >= 0)
+                            prev[next[from_index]] = -1;
+
+                        next[from_index] = fwd_index;
+
+                        if (alt_index >= 0)
+                            next[alt_index] = -1;
+
+                        prev[fwd_index] = from_index;
                     }
-                        
+                }
 
-                
+                // ----------- backward link -------------
+                if (bck.x >= 0 && bck.y >= 0) {
+                    int bck_index = idx(bck.x, bck.y, X);
+                    int alt_index = next[bck_index];  // bck 的后继
+                    cv::Point2i alt(alt_index % X, alt_index / X);
+
+                    if (prev[from_index] != bck_index &&
+                        (alt_index < 0 || chain(alt, bck, Ex, Ey, Gx, Gy, X, Y) > bck_s)) {
+
+                        if (alt_index >= 0)
+                            prev[alt_index] = -1;
+
+                        next[bck_index] = from_index;
+
+                        if (prev[from_index] >= 0)
+                            next[prev[from_index]] = -1;
+
+                        prev[from_index] = bck_index;
+                    }
                 }
             }
         }
     }
+ 
+#ifdef GTest
+    //  打开输出文件
+    std::ofstream file("next.txt");
+    for (int i = 0; i < X * Y; i++) {
+        file << next[i] << std::endl;
+    }
+    file.close();
+#endif // GTest
+
 
 
 }
@@ -550,13 +587,11 @@ void devernay(double** x, double** y, int* N, int** curve_limits, int* M,    // 
     fsy.release();
 #endif // GTest
 
-
-    cv::Mat next(Y, X, CV_32SC1);   /* next point in chain */
-    cv::Mat prev(Y, X, CV_32SC1);    /* prev point in chain */
-
     cv::Mat Ex(Y, X, CV_64F);        /* edge_x */
     cv::Mat Ey(Y, X, CV_64F);        /* edge_y */
     compute_edge_points(Ex, Ey, modG, Gx, Gy, X, Y);
 
-    //chain_edge_points();
+    int* next = (int*)malloc(X * Y * sizeof(int));
+    int* prev = (int*)malloc(X * Y * sizeof(int));
+    chain_edge_points(next, prev, Ex, Ey, Gx, Gy, X, Y);
 }

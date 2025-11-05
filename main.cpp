@@ -12,19 +12,13 @@
 int main() {
 
 	std::string path = "E:\\Code\\C++_Code\\Canny-Devernay\\data\\image.pgm";        // 图像路径
-
 	cv::Mat image = cv::imread(path, cv::IMREAD_GRAYSCALE); // 以灰度图的方式读取数据
-
 
 	int X = image.cols;    // 宽
 	int Y = image.rows;    // 高
 
 	cv::Mat image_d64;
 	image.convertTo(image_d64, CV_64F);  // 类型转换
-
-	//cv::imshow("df", image_d64);
-	//cv::waitKey();
-
 
 	double* x, * y;
 	int N, M;
